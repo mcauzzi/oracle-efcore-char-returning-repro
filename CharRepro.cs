@@ -29,8 +29,11 @@ await using (var conn = new OracleConnection(cs))
              {
                  DropIfExists("CHAR_REPRO"),
                  DropIfExists("CHAR_REPRO_NOT_FIXED_LENGTH"),
+                 DropIfExists("CHAR_REPRO_COMPUTED"),
                  "CREATE TABLE CHAR_REPRO (ID NUMBER(10) PRIMARY KEY, FLAG_FIXED_LENGTH CHAR(1) DEFAULT 'N' NOT NULL, FLAG_NOT_FIXED_LENGTH CHAR(1) DEFAULT 'N' NOT NULL)",
                  "CREATE TABLE CHAR_REPRO_NOT_FIXED_LENGTH (ID NUMBER(10) PRIMARY KEY, FLAG_NOT_FIXED_LENGTH CHAR(1) DEFAULT 'N' NOT NULL)",
+                 "CREATE TABLE CHAR_REPRO_COMPUTED (ID NUMBER(10) PRIMARY KEY, CODE VARCHAR2(10) NOT NULL, " +
+                 "FLAG_COMPUTED CHAR(1) GENERATED ALWAYS AS (CAST(SUBSTR(CODE, 1, 1) AS CHAR(1))) VIRTUAL)",
              })
     {
         cmd.CommandText = sql;
@@ -48,6 +51,51 @@ await Insert("3) 2 rows into CHAR_REPRO_NOT_FIXED_LENGTH", 2, ctx => ctx.NotFixe
              ("FLAG_NOT_FIXED_LENGTH", r => r.FlagNotFixedLength));
 
 // Inserts the rows in one SaveChanges, in a transaction that is never committed
+Console.WriteLine();
+Console.WriteLine("FLAG_COMPUTED is a virtual CHAR(1) column, the first letter of CODE, mapped with IsFixedLength() and HasComputedColumnSql().");
+await Computed("4) INSERT 1 row into CHAR_REPRO_COMPUTED", 1, update: false);
+await Computed("5) INSERT 2 rows into CHAR_REPRO_COMPUTED", 2, update: false);
+await Computed("6) UPDATE 1 row of CHAR_REPRO_COMPUTED", 1, update: true);
+await Computed("7) UPDATE 2 rows of CHAR_REPRO_COMPUTED", 2, update: true);
+
+// For the UPDATE cases the rows are inserted with plain SQL, then loaded and changed with EF Core
+async Task Computed(string title, int rows, bool update)
+{
+    Console.WriteLine();
+    Console.WriteLine(title);
+    await using var ctx = new ReproContext(cs);
+    await using var tx = await ctx.Database.BeginTransactionAsync();
+    List<CharReproComputed> entities;
+    if (update)
+    {
+        for (var id = 1; id <= rows; id++)
+            await ctx.Database.ExecuteSqlRawAsync($"INSERT INTO CHAR_REPRO_COMPUTED (ID, CODE) VALUES ({id}, 'A{id}')");
+        entities = await ctx.ComputedRows.OrderBy(r => r.Id).ToListAsync();
+        foreach (var e in entities) e.Code = "B" + e.Id;
+    }
+    else
+    {
+        entities = Enumerable.Range(1, rows).Select(id => new CharReproComputed { Id = id, Code = "A" + id }).ToList();
+        ctx.ComputedRows.AddRange(entities);
+    }
+    OutputParameters.Last.Clear();
+    try
+    {
+        await ctx.SaveChangesAsync();
+    }
+    catch (Exception ex)
+    {
+        Console.WriteLine($"   FLAG_COMPUTED          {Parameter("FLAG_COMPUTED")}");
+        Console.WriteLine($"   SaveChanges failed: {ex.GetBaseException().Message}   WRONG");
+        return;
+    }
+    var readBack = string.Join(",", entities.Select(e => Show(e.FlagComputed)));
+    var expected = string.Join(",", entities.Select(e => Show(e.Code![..1])));
+    var ok = entities.All(e => e.FlagComputed == e.Code![..1]);
+    Console.WriteLine($"   FLAG_COMPUTED          {Parameter("FLAG_COMPUTED"),-52} read back {readBack,-8} (expected {expected})   {(ok ? "OK" : "WRONG")}");
+    if (OutputParameters.Cursors > 0) Console.WriteLine($"   no output parameter per column: generated values read with {OutputParameters.Cursors} REF CURSOR(s)");
+}
+
 async Task Insert<T>(string title, int rows, Func<ReproContext, DbSet<T>> set, Func<int, T> create,
                      params (string Column, Func<T, string?> Value)[] columns) where T : class
 {
@@ -124,8 +172,10 @@ public class OutputParameters : DbCommandInterceptor
 
     static void Record(DbCommand command)
     {
-        if (!command.CommandText.Contains("INSERT")) return;
-        var outputs = command.Parameters.Cast<OracleParameter>().Where(p => p.Direction != ParameterDirection.Input).ToList();
+        if (!command.CommandText.Contains("INSERT") && !command.CommandText.Contains("UPDATE")) return;
+        var outputs = command.Parameters.Cast<OracleParameter>()
+                             .Where(p => p.Direction != ParameterDirection.Input && !p.ParameterName.Contains("cnt"))   // row counts
+                             .ToList();
         Cursors = outputs.Count(p => p.OracleDbType == OracleDbType.RefCursor);
         var returning = Regex.Match(command.CommandText, @"RETURNING\s+(.+?)\s+(INTO|BULK)", RegexOptions.Singleline);
         if (!returning.Success || Cursors > 0) return;
@@ -140,10 +190,18 @@ public class OutputParameters : DbCommandInterceptor
     }
 }
 
+public class CharReproComputed
+{
+    public int Id { get; set; }
+    public string? Code { get; set; }
+    public string? FlagComputed { get; set; }
+}
+
 public class ReproContext(string cs) : DbContext
 {
     public DbSet<CharRepro> Rows => Set<CharRepro>();
     public DbSet<CharReproNotFixedLength> NotFixedLengthRows => Set<CharReproNotFixedLength>();
+    public DbSet<CharReproComputed> ComputedRows => Set<CharReproComputed>();
 
     protected override void OnConfiguring(DbContextOptionsBuilder o) =>
         o.UseOracle(cs)
@@ -169,6 +227,14 @@ public class ReproContext(string cs) : DbContext
             e.Property(x => x.Id).HasColumnName("ID").ValueGeneratedNever();
             e.Property(x => x.FlagNotFixedLength).HasColumnName("FLAG_NOT_FIXED_LENGTH").HasMaxLength(1).IsUnicode(false)
              .HasDefaultValueSql("'N'").ValueGeneratedOnAdd();
+        });
+        b.Entity<CharReproComputed>(e =>
+        {
+            e.ToTable("CHAR_REPRO_COMPUTED");
+            e.Property(x => x.Id).HasColumnName("ID").ValueGeneratedNever();
+            e.Property(x => x.Code).HasColumnName("CODE").HasMaxLength(10).IsUnicode(false);
+            e.Property(x => x.FlagComputed).HasColumnName("FLAG_COMPUTED").HasMaxLength(1).IsUnicode(false)
+             .IsFixedLength().HasComputedColumnSql("CAST(SUBSTR(CODE, 1, 1) AS CHAR(1))");
         });
     }
 }

@@ -1,17 +1,18 @@
-# Oracle.EntityFrameworkCore 10.23.26400: CHAR column read back after INSERT
+# Oracle.EntityFrameworkCore 10.23.26400: CHAR column read back after INSERT or UPDATE
 
 Repro for an Oracle.EntityFrameworkCore issue: a `CHAR(1)` column with a database default, mapped with
 `IsFixedLength()` as `dotnet ef dbcontext scaffold` generates it, is read back as `''` after inserting one row, and
 inserting two rows in the same `SaveChanges` fails with `ORA-50029: OracleParameter.ArrayBindSize is invalid`.
-It works with Oracle.EntityFrameworkCore 8.23.90. Details in [ISSUE.md](ISSUE.md).
+A computed `CHAR(1)` column behaves the same after `INSERT` and after `UPDATE`. It works with
+Oracle.EntityFrameworkCore 8.23.90. Details in [ISSUE.md](ISSUE.md).
 
 ## Run
 
 The program is `CharRepro.cs`, a single file with no project file. It needs:
 
 - the .NET 10 SDK, plus the .NET 8 runtime for `-f net8.0`;
-- a database user that can create and drop tables: the program creates `CHAR_REPRO` and
-  `CHAR_REPRO_NOT_FIXED_LENGTH` and runs each case in a transaction that is rolled back.
+- a database user that can create and drop tables: the program creates `CHAR_REPRO`,
+  `CHAR_REPRO_NOT_FIXED_LENGTH` and `CHAR_REPRO_COMPUTED` and runs each case in a transaction that is rolled back.
 
 ```
 dotnet run CharRepro.cs -f net10.0 -- "User Id=...;Password=...;Data Source=..."
@@ -22,13 +23,16 @@ dotnet run CharRepro.cs -f net8.0  -- "User Id=...;Password=...;Data Source=..."
 
 Both columns of `CHAR_REPRO` are `CHAR(1) DEFAULT 'N'`: `FLAG_FIXED_LENGTH` is mapped with `IsFixedLength()`,
 `FLAG_NOT_FIXED_LENGTH` without it. `CHAR_REPRO_NOT_FIXED_LENGTH` shows that two rows work when no column is mapped
-with `IsFixedLength()` (case 2 cannot show it, because the whole command fails). For each column the program prints the
+with `IsFixedLength()` (case 2 cannot show it, because the whole command fails). Cases 4 to 7 use
+`CHAR_REPRO_COMPUTED`, whose `FLAG_COMPUTED CHAR(1)` is the first letter of `CODE`; for the `UPDATE` cases the rows are
+inserted with plain SQL first. For each column the program prints the
 output parameter EF Core hands to ODP.NET (recorded by a `DbCommandInterceptor` before the command runs), the value
 read back into the entity, the value in the table, and `OK` or `WRONG`.
 
 Output with `-f net10.0`:
 
 ```
+D:\ArtifactLavoro\OracleEfCharArrayBind\CharRepro.cs(72,32): warning EF1002: Method 'ExecuteSqlRawAsync' inserts interpolated strings directly into the SQL, without any protection against SQL injection. Consider using 'ExecuteSqlAsync' instead, which protects against SQL injection, or make sure that the value is sanitized and suppress the warning.
 Oracle Database 23.26.3.0.0, .NET 10.0.15, Oracle.EntityFrameworkCore assembly 10.0.23.1-20260923, Microsoft.EntityFrameworkCore.Relational 10.0.0, Oracle.ManagedDataAccess.Core 23.26.400
 Every column is CHAR(1) DEFAULT 'N' and the program does not set it: EF Core must read back 'N'.
 FLAG_FIXED_LENGTH is mapped with IsFixedLength(), as scaffolded; FLAG_NOT_FIXED_LENGTH is mapped without it.
@@ -44,6 +48,22 @@ FLAG_FIXED_LENGTH is mapped with IsFixedLength(), as scaffolded; FLAG_NOT_FIXED_
 
 3) 2 rows into CHAR_REPRO_NOT_FIXED_LENGTH
    FLAG_NOT_FIXED_LENGTH  output Varchar2, array, ArrayBindSize=[4000,4000]    read back 'N','N'  (table 'N','N')   OK
+
+FLAG_COMPUTED is a virtual CHAR(1) column, the first letter of CODE, mapped with IsFixedLength() and HasComputedColumnSql().
+
+4) INSERT 1 row into CHAR_REPRO_COMPUTED
+   FLAG_COMPUTED          output Char, Size=0                                  read back ''       (expected 'A')   WRONG
+
+5) INSERT 2 rows into CHAR_REPRO_COMPUTED
+   FLAG_COMPUTED          output Char, array, ArrayBindSize=null
+   SaveChanges failed: ORA-50029: OracleParameter.ArrayBindSize is invalid   WRONG
+
+6) UPDATE 1 row of CHAR_REPRO_COMPUTED
+   FLAG_COMPUTED          output Char, Size=0                                  read back ''       (expected 'B')   WRONG
+
+7) UPDATE 2 rows of CHAR_REPRO_COMPUTED
+   FLAG_COMPUTED          output Char, array, ArrayBindSize=null
+   SaveChanges failed: ORA-50029: OracleParameter.ArrayBindSize is invalid   WRONG
 ```
 
 With `-f net8.0` every line is `OK`; the generated values are read with one `REF CURSOR` per row.
